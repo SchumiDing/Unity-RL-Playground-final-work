@@ -1,0 +1,73 @@
+default_settings:
+  trainer_type: ppo
+  hyperparameters:
+    batch_size: 2048
+    buffer_size: 20480
+    learning_rate: 0.0003
+    learning_rate_schedule: linear
+    beta: 0.005
+    epsilon: 0.2
+    lambd: 0.95
+    num_epoch: 3
+    beta_schedule: linear
+    epsilon_schedule: linear
+  network_settings:
+    normalize: true
+    hidden_units: 512
+    num_layers: 3
+    vis_encode_type: simple
+    deterministic: false
+  reward_signals:
+    extrinsic:
+      gamma: 0.99
+      strength: 1.0
+      network_settings:
+        normalize: false
+        hidden_units: 128
+        num_layers: 2
+        vis_encode_type: simple
+        deterministic: false
+  max_steps: 10000000
+  time_horizon: 1000
+  summary_freq: 20000
+  threaded: false
+  checkpoint_interval: 500000
+  keep_checkpoints: 5
+
+behaviors:
+  Go2Navigation:
+    trainer_type: ppo
+    hyperparameters:
+      batch_size: 2048
+      buffer_size: 20480
+      learning_rate: 0.0003
+      learning_rate_schedule: linear
+      beta: 0.005
+      epsilon: 0.2
+      lambd: 0.95
+      num_epoch: 3
+      beta_schedule: linear
+      epsilon_schedule: linear
+    network_settings:
+      normalize: true
+      hidden_units: 512
+      num_layers: 3
+      vis_encode_type: simple
+      deterministic: false
+    reward_signals:
+      extrinsic:
+        gamma: 0.99
+        strength: 1.0
+        network_settings:
+          normalize: false
+          hidden_units: 128
+          num_layers: 2
+          vis_encode_type: simple
+          deterministic: false
+    max_steps: 10000000
+    time_horizon: 1000
+    summary_freq: 20000
+    threaded: false
+    checkpoint_interval: 500000
+    keep_checkpoints: 5
+

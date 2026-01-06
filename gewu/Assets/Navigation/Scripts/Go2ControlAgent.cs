@@ -40,12 +40,12 @@ public class Go2ControlAgent : Agent
     float dh = 25;
     float d0 = 15;
     
-    // 控制参数（5维输入）
-    float controlParam1 = 0f;  // 左平移
-    float controlParam2 = 0f;  // 右平移
-    float controlParam3 = 0f;  // 原地左转
-    float controlParam4 = 0f;  // 原地右转
-    float controlParam5 = 0f;  // 后退
+    // 控制参数（5维输入）- 公开以便外部访问
+    public float controlParam1 = 0f;  // 左平移
+    public float controlParam2 = 0f;  // 右平移
+    public float controlParam3 = 0f;  // 原地左转
+    public float controlParam4 = 0f;  // 原地右转
+    public float controlParam5 = 0f;  // 后退
     
     // 目标速度（根据控制参数计算）
     float v1 = 0;  // 前进速度（正值为前进，负值为后退）
@@ -88,6 +88,20 @@ public class Go2ControlAgent : Agent
     public float optimalTurnSpeedMax = 1.5f;  // 最优转向速度区间最大值
     public float highRewardMultiplier = 2.0f;  // 最优速度区间奖励倍数
     public float lowRewardMultiplier = 0.5f;  // 非最优速度区间奖励倍数
+    [Header("演示模式")]
+    public bool enableDemoMode = false;  // 启用演示模式（自动切换动作，仅非训练模式）
+    public float demoSwitchInterval = 5f;  // 演示切换间隔（秒）
+    [Header("训练监控")]
+    public bool showTrainingStats = true;  // 显示训练统计信息
+    public float statsUpdateInterval = 2f;  // 统计更新间隔（秒）
+    private float demoTimer = 0f;
+    private float statsTimer = 0f;
+    private int demoActionIndex = 0;
+    private float episodeReward = 0f;
+    private int episodeStepCount = 0;
+    private ActionMode[] demoActions = { ActionMode.Forward, ActionMode.LeftStrafe, ActionMode.RightStrafe, 
+                                         ActionMode.LeftTurn, ActionMode.RightTurn, ActionMode.Backward };
+    private string[] actionNames = { "前进", "左平移", "右平移", "原地左转", "原地右转", "后退" };
 
     public override void Initialize()
     {
@@ -115,7 +129,7 @@ public class Go2ControlAgent : Agent
     void ParseAgentGroupAndMode()
     {
         // 解析agent名称，确定组索引和动作模式
-        // 命名格式：Go2ControlAgent 或 Go2ControlAgent_Clone_X，其中X是索引（1-47）
+        // 命名格式：Go2ControlAgent 或 Go2ControlAgent_Clone_X，其中X是索引（1-191）
         string agentName = this.name;
         
         // 提取克隆索引（原始agent索引为0，Clone_1索引为1，以此类推）
@@ -130,15 +144,15 @@ public class Go2ControlAgent : Agent
         }
         // 原始agent的cloneIndex保持为0
         
-        // 48个agent（索引0-47），每8个一组，共6组对应6种动作
-        // Group 0: 索引 0-7   -> 前进
-        // Group 1: 索引 8-15  -> 左平移
-        // Group 2: 索引 16-23 -> 右平移
-        // Group 3: 索引 24-31 -> 原地左转
-        // Group 4: 索引 32-39 -> 原地右转
-        // Group 5: 索引 40-47 -> 后退
-        int groupIndex = cloneIndex / 8;  // 0-5
-        agentGroupIndex = cloneIndex % 8;  // 0-7
+        // 192个agent（索引0-191），每32个一组，共6组对应6种动作
+        // Group 0: 索引 0-31    -> 前进
+        // Group 1: 索引 32-63   -> 左平移
+        // Group 2: 索引 64-95   -> 右平移
+        // Group 3: 索引 96-127  -> 原地左转
+        // Group 4: 索引 128-159 -> 原地右转
+        // Group 5: 索引 160-191 -> 后退
+        int groupIndex = cloneIndex / 32;  // 0-5
+        agentGroupIndex = cloneIndex % 32;  // 0-31
         
         // 确保groupIndex在有效范围内
         if (groupIndex < 0) groupIndex = 0;
@@ -150,7 +164,7 @@ public class Go2ControlAgent : Agent
         SetControlParamsFromMode(currentActionMode);
     }
 
-    void SetControlParamsFromMode(ActionMode mode)
+    public void SetControlParamsFromMode(ActionMode mode)
     {
         // 重置所有控制参数
         controlParam1 = 0f;
@@ -213,8 +227,8 @@ public class Go2ControlAgent : Agent
 
         if (train && !_isClone) 
         {
-            // 创建48个训练实例，每8个一组，共6组对应6种动作
-            for (int i = 1; i < 48; i++)
+            // 创建192个训练实例（6*32），每32个一组，共6组对应6种动作
+            for (int i = 1; i < 192; i++)
             {
                 GameObject clone = Instantiate(gameObject); 
                 clone.name = $"{name}_Clone_{i}"; 
@@ -227,6 +241,8 @@ public class Go2ControlAgent : Agent
     {
         tp = 0;
         tt = 0;
+        episodeStepCount = 0;
+        episodeReward = 0f;
         for (int i = 0; i < 12; i++) u[i] = 0;
 
         ObservationNum = 17 + 2 * ActionNum;  // 3(重力) + 3(角速度) + 3(线速度) + 2*ActionNum(关节) + 3(目标速度) + 5(预留控制参数)
@@ -240,6 +256,12 @@ public class Go2ControlAgent : Agent
         {
             currentActionMode = ActionMode.Forward;
             SetControlParamsFromMode(currentActionMode);
+        }
+        
+        // 训练监控：显示episode开始信息
+        if (train && showTrainingStats && !_isClone)
+        {
+            Debug.Log($"[训练开始] Episode开始 | 动作模式: {actionNames[(int)currentActionMode]}");
         }
         
         if (fixbody) 
@@ -370,6 +392,24 @@ public class Go2ControlAgent : Agent
 
     void FixedUpdate()
     {
+        // 演示模式：自动切换动作（仅原始agent，非训练模式）
+        if (!train && !_isClone && enableDemoMode)
+        {
+            demoTimer += Time.fixedDeltaTime;
+            if (demoTimer >= demoSwitchInterval)
+            {
+                demoTimer = 0f;
+                demoActionIndex = (demoActionIndex + 1) % demoActions.Length;
+                currentActionMode = demoActions[demoActionIndex];
+                SetControlParamsFromMode(currentActionMode);
+                Debug.Log($"[演示模式] 切换到动作: {actionNames[demoActionIndex]}");
+                // 重置位置以便观察
+                arts[0].TeleportRoot(pos0, rot0);
+                arts[0].velocity = Vector3.zero;
+                arts[0].angularVelocity = Vector3.zero;
+            }
+        }
+        
         tp++;
         tt++;
         
@@ -484,13 +524,51 @@ public class Go2ControlAgent : Agent
             height_reward = -0.1f * Mathf.Abs(body.position.y - pos0.y);
         }
         
+        // 摔倒惩罚
+        var fall_penalty = 0f;
+        if (IsFallen())
+        {
+            fall_penalty = -2f;  // 摔倒惩罚
+        }
+        
         // 总奖励
         var reward = live_reward + 
                      (ori_reward1 + ori_reward2) * ko + 
                      vel_reward * kv +
-                     height_reward;
+                     height_reward +
+                     fall_penalty;
         
         AddReward(reward);
+        episodeReward += reward;
+        episodeStepCount++;
+        
+        // 训练监控：定期显示训练统计（仅原始agent）
+        if (train && showTrainingStats && !_isClone)
+        {
+            statsTimer += Time.fixedDeltaTime;
+            if (statsTimer >= statsUpdateInterval)
+            {
+                statsTimer = 0f;
+                // 使用已声明的vel和wel变量
+                float avgReward = episodeReward / Mathf.Max(1, episodeStepCount);
+                Debug.Log($"[训练监控] 动作: {actionNames[(int)currentActionMode]} | " +
+                         $"步数: {episodeStepCount}/{maxEpisodeSteps} | " +
+                         $"平均奖励: {avgReward:F3} | " +
+                         $"速度: ({vel[2]:F2}, {vel[0]:F2}) | " +
+                         $"角速度: {wel[1]:F2} | " +
+                         $"姿态: P={EulerTrans(body.eulerAngles[0]):F1}°, R={EulerTrans(body.eulerAngles[2]):F1}°");
+            }
+        }
+        
+        // 演示模式：显示当前动作和效果（仅原始agent，非训练模式）
+        if (!train && !_isClone && enableDemoMode && tt % 100 == 0)
+        {
+            // 使用已声明的vel和wel变量
+            Debug.Log($"[演示] 动作: {actionNames[(int)currentActionMode]} | " +
+                     $"速度: ({vel[0]:F2}, {vel[1]:F2}, {vel[2]:F2}) | " +
+                     $"角速度: ({wel[0]:F2}, {wel[1]:F2}, {wel[2]:F2}) | " +
+                     $"姿态: Pitch={EulerTrans(body.eulerAngles[0]):F1}°, Roll={EulerTrans(body.eulerAngles[2]):F1}°");
+        }
         
         // 检查是否应该结束episode
         if (Mathf.Abs(pitch) > maxTiltAngle || 
@@ -498,8 +576,36 @@ public class Go2ControlAgent : Agent
             tt >= maxEpisodeSteps ||
             body.position.y < pos0.y - 0.3f)  // 如果摔倒（高度过低）
         {
-            if(train) EndEpisode();
+            if(train) 
+            {
+                // 训练监控：显示episode结束信息
+                if (showTrainingStats && !_isClone)
+                {
+                    string reason = "";
+                    if (Mathf.Abs(pitch) > maxTiltAngle || Mathf.Abs(roll) > maxTiltAngle) reason = "倾斜过度";
+                    else if (tt >= maxEpisodeSteps) reason = "达到最大步数";
+                    else if (body.position.y < pos0.y - 0.3f) reason = "摔倒";
+                    
+                    Debug.Log($"[训练结束] Episode结束 | 动作: {actionNames[(int)currentActionMode]} | " +
+                             $"总步数: {episodeStepCount} | " +
+                             $"总奖励: {episodeReward:F2} | " +
+                             $"平均奖励: {(episodeReward / Mathf.Max(1, episodeStepCount)):F3} | " +
+                             $"原因: {reason}");
+                }
+                EndEpisode();
+            }
         }
+    }
+    
+    bool IsFallen()
+    {
+        // 检查是否摔倒：高度过低或姿态过度倾斜
+        bool heightTooLow = body.position.y < pos0.y - 0.3f;
+        float pitch = EulerTrans(body.eulerAngles[0]);
+        float roll = EulerTrans(body.eulerAngles[2]);
+        bool tiltTooMuch = Mathf.Abs(pitch) > 45f || Mathf.Abs(roll) > 45f;
+        
+        return heightTooLow || tiltTooMuch;
     }
 }
 
