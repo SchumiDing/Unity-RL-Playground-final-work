@@ -52,6 +52,7 @@ public class Go2NavigationAgent : Agent
     private float episodeTime;
     private bool hasReachedTarget = false;
     private int tt = 0;  // 步数计数器
+    private bool episodeEnded = false;  // 防止重复调用EndEpisode
     
     // 倒地检测参数
     private float fallenTime = 0f;  // 倒地持续时间
@@ -168,10 +169,14 @@ public class Go2NavigationAgent : Agent
     
     public override void OnEpisodeBegin()
     {
+        // 自动识别克隆体（防止Initialize时机问题）
+        if (name.Contains("Clone")) _isClone = true;
+        
         // 如果是原始agent且训练模式，重置全局时间窗口
         if (train && !_isClone)
         {
             globalEpisodeStartTime = Time.time;
+            globalEpisodeDuration = maxEpisodeTime;  // 每次episode开始时更新全局时间窗口（支持运行时修改）
             globalEpisodeEnded = false;
         }
         
@@ -184,9 +189,10 @@ public class Go2NavigationAgent : Agent
         tt = 0;  // 重置步数计数器
         fallenTime = 0f;  // 重置倒地时间
         stillTime = 0f;  // 重置静止时间
+        episodeEnded = false;  // 重置episode结束标志
         
         // 调试：确认episode开始
-        if (train && !_isClone && tt == 0)
+        if (train && !_isClone)
         {
             Debug.Log($"[导航训练] Episode开始 | maxEpisodeTime={maxEpisodeTime}s | 全局时间窗口={globalEpisodeDuration}s");
         }
@@ -194,44 +200,49 @@ public class Go2NavigationAgent : Agent
         // 重置位置历史
         positionHistory.Clear();
         timeHistory.Clear();
-        for (int i = 0; i < historyLength; i++)
-        {
-            positionHistory.Enqueue(body.position);
-            timeHistory.Enqueue(0f);
-        }
         
         // 设置起始位置和目标位置
         if (train)
         {
-            // 为每个agent设置不同的随机起始位置（避免重叠）
-            int agentIndex = _isClone ? int.Parse(name.Substring(name.LastIndexOf("_") + 1)) : 0;
-            float spacing = 3f;  // agent之间的间距
+            // 修复：使用初始场景坐标 pos0 作为绝对锚点，防止位置累加漂移
+            int agentIndex = 0;
+            if (_isClone)
+            {
+                string indexStr = name.Substring(name.LastIndexOf("_") + 1);
+                int.TryParse(indexStr, out agentIndex);
+            }
+            
+            float spacing = 12f;  // 增大间距防止干扰
             float gridSize = Mathf.Ceil(Mathf.Sqrt(64));  // 8x8网格
             int row = agentIndex / (int)gridSize;
             int col = agentIndex % (int)gridSize;
             
-            // 基础位置 + 网格偏移 + 随机扰动
-            Vector3 baseOffset = new Vector3(
-                (col - gridSize / 2) * spacing,
+            // 计算专属网格的绝对坐标（以pos0为中心）
+            Vector3 gridOffset = new Vector3(
+                (col - gridSize / 2f) * spacing,
                 0,
-                (row - gridSize / 2) * spacing
+                (row - gridSize / 2f) * spacing
             );
             
-            startPoint = body.position + baseOffset + new Vector3(
+            // 最终起始点：初始位置 + 网格偏移 + 随机抖动
+            startPoint = pos0 + gridOffset + new Vector3(
                 Random.Range(-1f, 1f),
-                0,
+                0.1f,  // 略微抬高防止卡地
                 Random.Range(-1f, 1f)
             );
             
-            // 重置机器人位置和姿态
-            arts[0].TeleportRoot(startPoint, rot0);
-            arts[0].velocity = Vector3.zero;
-            arts[0].angularVelocity = Vector3.zero;
+            // 强制重置高度，防止掉落或卡死
+            startPoint.y = pos0.y + 0.1f;
             
-            // 更新初始位置记录
-            pos0 = startPoint;
+            // 重置机器人位置和姿态（使用TeleportRoot确保物理正确）
+            if (arts[0] != null)
+            {
+                arts[0].TeleportRoot(startPoint, rot0);
+                arts[0].velocity = Vector3.zero;
+                arts[0].angularVelocity = Vector3.zero;
+            }
             
-            // 随机目标位置（距离起始点一定范围）
+            // 随机目标位置（相对于当前 startPoint）
             float distance = Random.Range(5f, 15f);
             float angle = Random.Range(0f, 360f) * Mathf.Deg2Rad;
             Vector3 targetPos = startPoint + new Vector3(
@@ -250,14 +261,23 @@ public class Go2NavigationAgent : Agent
                 targetPoint.position = targetPos;
             }
         }
-        
-        // 重置机器人位置
-        body.position = startPoint;
-        body.rotation = Quaternion.identity;
-        if (arts[0] != null)
+        else
         {
-            arts[0].velocity = Vector3.zero;
-            arts[0].angularVelocity = Vector3.zero;
+            // 非训练模式，回到初始点
+            if (arts[0] != null)
+            {
+                arts[0].TeleportRoot(pos0, rot0);
+                arts[0].velocity = Vector3.zero;
+                arts[0].angularVelocity = Vector3.zero;
+            }
+            startPoint = pos0;
+        }
+        
+        // 初始化位置历史（使用重置后的位置）
+        for (int i = 0; i < historyLength; i++)
+        {
+            positionHistory.Enqueue(startPoint);
+            timeHistory.Enqueue(0f);
         }
         
         lastPosition = startPoint;
@@ -434,6 +454,12 @@ public class Go2NavigationAgent : Agent
     
     void FixedUpdate()
     {
+        // 如果episode已经结束，不再执行任何操作（防止重复调用）
+        if (episodeEnded)
+        {
+            return;
+        }
+        
         // 更新当前位置
         currentPosition = body.position;
         
@@ -451,10 +477,26 @@ public class Go2NavigationAgent : Agent
         
         // 检查episode结束条件（必须在AddReward之后调用，与其他训练脚本保持一致）
         // 参考Go2StandAgent和Go2WalkAgent的模式：AddReward -> 检查条件 -> EndEpisode
+        // 重要：完全按照Go2StandAgent和Go2WalkAgent的方式，直接调用EndEpisode()
         bool shouldEnd = CheckEpisodeEnd();
         
         if (shouldEnd && train)
         {
+            // 标记episode已结束，防止重复调用EndEpisode()
+            episodeEnded = true;
+            
+            // 获取目标点位置用于日志
+            Vector3 targetPos = (targetPointInstance != null) ? targetPointInstance.position : 
+                               (targetPoint != null ? targetPoint.position : Vector3.zero);
+            float distanceToTarget = Vector3.Distance(currentPosition, targetPos);
+            
+            // 调试：确认EndEpisode被调用（所有agent都输出，便于调试）
+            // 重要：必须在EndEpisode()之前打印日志，因为某些ML-Agents版本中EndEpisode会同步触发OnEpisodeBegin并重置tt和时间
+            Debug.Log($"[Episode结束] Agent: {name} | EndEpisode()已调用 | 步数: {tt} | 时间: {episodeTime:F2}s | 距离目标: {distanceToTarget:F2}m | 是否克隆: {_isClone}");
+            
+            // 直接调用EndEpisode()，确保ML-Agents能接收到结束信号
+            // 对于提前终止的情况（姿态倾斜、摔倒等），也要确保正确结束
+            // 完全按照Go2StandAgent和Go2WalkAgent的方式处理
             EndEpisode();
         }
         
@@ -466,11 +508,19 @@ public class Go2NavigationAgent : Agent
         float reward = 0f;
         
         // 获取目标点位置（使用目标点实例或原始目标点）
-        Vector3 targetPos = (targetPointInstance != null) ? targetPointInstance.position : targetPoint.position;
+        Vector3 targetPos = (targetPointInstance != null) ? targetPointInstance.position : 
+                           (targetPoint != null ? targetPoint.position : Vector3.zero);
         
         // 1. 到达目标奖励（大奖励）
         float distanceToTarget = Vector3.Distance(currentPosition, targetPos);
-        if (distanceToTarget < targetReachDistance && !hasReachedTarget)
+        
+        // 安全保护：如果距离异常大（可能是位置漂移），限制奖励计算
+        if (distanceToTarget > 1000f)
+        {
+            // 距离异常，只给很小的惩罚，防止奖励值爆炸
+            reward -= 0.1f;
+        }
+        else if (distanceToTarget < targetReachDistance && !hasReachedTarget)
         {
             reward += 10f;  // 到达目标
             hasReachedTarget = true;
@@ -480,6 +530,8 @@ public class Go2NavigationAgent : Agent
             // 接近目标奖励（鼓励向目标移动）
             float lastDistance = Vector3.Distance(lastPosition, targetPos);
             float distanceImprovement = lastDistance - distanceToTarget;
+            // 限制单步奖励幅度，防止异常值
+            distanceImprovement = Mathf.Clamp(distanceImprovement, -10f, 10f);
             reward += distanceImprovement * 0.5f;  // 每接近1米奖励0.5
         }
         
@@ -492,6 +544,8 @@ public class Go2NavigationAgent : Agent
         // 3. 速度奖励（鼓励移动）
         Vector3 velocity = (currentPosition - lastPosition) / Time.fixedDeltaTime;
         float speed = velocity.magnitude;
+        // 限制速度值，防止异常
+        speed = Mathf.Clamp(speed, 0f, 10f);
         if (speed > 0.1f && !hasReachedTarget)
         {
             reward += 0.01f * speed;  // 速度奖励
@@ -521,6 +575,15 @@ public class Go2NavigationAgent : Agent
             reward -= 5f;  // 摔倒大惩罚
         }
         
+        // 安全保护：防止 NaN 和 Infinity 导致 ML-Agents 崩溃
+        if (float.IsNaN(reward) || float.IsInfinity(reward))
+        {
+            reward = 0f;
+        }
+        
+        // 限制奖励值范围，防止异常大的奖励值
+        reward = Mathf.Clamp(reward, -50f, 50f);
+        
         AddReward(reward);
     }
     
@@ -544,6 +607,10 @@ public class Go2NavigationAgent : Agent
     
     bool CheckEpisodeEnd()
     {
+        // 重要：确保每个episode至少运行一小段时间，避免ML-Agents训练端出现同步问题
+        // 如果步数太少（例如刚开始几个FixedUpdate），不触发任何结束逻辑，防止无限重启循环
+        if (tt < 10) return false;
+
         bool shouldEnd = false;
         string endReason = "";
         
@@ -551,20 +618,31 @@ public class Go2NavigationAgent : Agent
         if (train)
         {
             float globalElapsedTime = Time.time - globalEpisodeStartTime;
-            if (globalElapsedTime >= globalEpisodeDuration && !globalEpisodeEnded)
+            
+            // 如果全局时间窗口已超时
+            if (globalElapsedTime >= globalEpisodeDuration)
             {
-                shouldEnd = true;
-                endReason = $"全局时间窗口超时（{globalEpisodeDuration}秒）";
-                
-                // 标记全局episode已结束（只标记一次）
-                if (!_isClone)
+                // 关键修复：只有当Agent是在当前全局周期开始前或者周期内启动时，才跟随全局结束
+                // 如果Agent是刚刚启动的（episodeStartTime 晚于当前周期的预期结束时间），则不立即结束
+                // 这防止了克隆Agent在主Agent重置全局计时器之前陷入无限重启循环
+                if (episodeStartTime < globalEpisodeStartTime + globalEpisodeDuration - 0.1f)
                 {
-                    globalEpisodeEnded = true;
-                    Debug.Log($"[全局时间窗口] 触发所有agent同时结束 | 全局时间={globalElapsedTime:F2}s");
+                    shouldEnd = true;
+                    endReason = $"全局时间窗口超时（同步结束，全局已运行{globalElapsedTime:F1}s）";
+                    
+                    // 标记全局episode已结束（只由主Agent标记一次，用于日志）
+                    if (!globalEpisodeEnded && !_isClone)
+                    {
+                        globalEpisodeEnded = true;
+                        Debug.Log($"[全局时间窗口] 触发同步结束 | 全局时间={globalElapsedTime:F2}s");
+                    }
                 }
             }
         }
         
+        // 如果已经因为全局窗口决定结束，跳过后续检查
+        if (shouldEnd) return true;
+
         // 1. 到达目标
         if (hasReachedTarget)
         {
@@ -572,32 +650,14 @@ public class Go2NavigationAgent : Agent
             endReason = "到达目标";
         }
         
-        // 2. 超时（导航时间过长）- 作为备用检查
-        // 使用>=确保超时一定会触发
+        // 2. 局部超时（单个Agent导航时间过长）
         if (episodeTime >= maxEpisodeTime)
         {
             shouldEnd = true;
-            endReason = $"超时（{maxEpisodeTime}秒）";
-            
-            // 调试：确认超时检测被触发
-            if (train && !_isClone)
-            {
-                Debug.Log($"[超时检测] 触发超时 | episodeTime={episodeTime:F2}s | maxEpisodeTime={maxEpisodeTime}s");
-            }
+            endReason = $"局部超时（已运行{episodeTime:F1}s）";
         }
         
-        // 调试：每5秒输出一次episode状态（仅原始agent，训练模式）
-        if (train && !_isClone && tt > 0 && tt % 500 == 0)  // FixedUpdate是0.01秒，500步=5秒
-        {
-            Vector3 targetPos = (targetPointInstance != null) ? targetPointInstance.position : targetPoint.position;
-            float distanceToTarget = Vector3.Distance(currentPosition, targetPos);
-            Debug.Log($"[调试] Episode状态 | 时间: {episodeTime:F1}s/{maxEpisodeTime}s | " +
-                     $"步数: {tt} | 是否到达: {hasReachedTarget} | " +
-                     $"距离目标: {distanceToTarget:F2}m | " +
-                     $"位置: ({currentPosition.x:F1}, {currentPosition.y:F1}, {currentPosition.z:F1})");
-        }
-        
-        // 3. 检查是否摔倒
+        // 3. 检查是否摔倒（长时间不移动）
         bool isFallen = IsFallen();
         if (isFallen)
         {
@@ -632,23 +692,31 @@ public class Go2NavigationAgent : Agent
             stillTime = 0f;
         }
         
-        // 4. 姿态过度倾斜（立即结束）
+        /* 
+        // 4. 姿态过度倾斜（立即结束） - 已根据要求关闭
+        // 增加tt检查，给物理引擎几步时间稳定姿态
         float pitch = EulerTrans(body.eulerAngles.x);
         float roll = EulerTrans(body.eulerAngles.z);
-        if (Mathf.Abs(pitch) > 60f || Mathf.Abs(roll) > 60f)
+        if (tt > 20 && (Mathf.Abs(pitch) > 60f || Mathf.Abs(roll) > 60f))
         {
             shouldEnd = true;
             endReason = $"姿态过度倾斜（Pitch={pitch:F1}°, Roll={roll:F1}°）";
         }
+        */
         
-        // 如果应该结束，输出日志（但不在这里调用EndEpisode，由FixedUpdate调用）
-        if (shouldEnd && train && !string.IsNullOrEmpty(endReason) && !_isClone)
+        // 如果决定结束，输出日志
+        if (shouldEnd && train && !string.IsNullOrEmpty(endReason))
         {
-            Vector3 targetPos = (targetPointInstance != null) ? targetPointInstance.position : targetPoint.position;
-            Debug.Log($"[导航训练] Episode结束 | 原因: {endReason} | " +
-                     $"时间: {episodeTime:F1}s | " +
-                     $"步数: {tt} | " +
-                     $"距离目标: {Vector3.Distance(currentPosition, targetPos):F2}m");
+            // 仅在主Agent或由于特定原因（非全局同步）结束时输出详细日志，避免日志溢出
+            if (!_isClone || !endReason.Contains("全局"))
+            {
+                Vector3 targetPos = (targetPointInstance != null) ? targetPointInstance.position : targetPoint.position;
+                Debug.Log($"[导航训练] Episode结束 | 原因: {endReason} | " +
+                         $"时间: {episodeTime:F1}s | " +
+                         $"步数: {tt} | " +
+                         $"距离目标: {Vector3.Distance(currentPosition, targetPos):F2}m | " +
+                         $"Agent: {name}");
+            }
         }
         
         return shouldEnd;
