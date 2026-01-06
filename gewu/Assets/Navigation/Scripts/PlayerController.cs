@@ -41,15 +41,22 @@ public class PlayerController : MonoBehaviour
 			}
 		}
 		
-		agent.SetDestination(targetPos);
-		lineRenderer.positionCount = agent.path.corners.Length;
-		var corners = agent.path.corners;
-		lineRenderer.SetPositions(corners);
-		if (lineRenderer.positionCount>0) // ���·�����ڼ�����
+		if (agent != null)
 		{
-			//animator.SetBool("Run", true);
-			// Debug.Log("����ΪTrue��");
+			agent.SetDestination(targetPos);
 			
+			// 只有当lineRenderer已分配时才使用
+			if (lineRenderer != null && agent.path != null && agent.path.corners != null)
+			{
+				lineRenderer.positionCount = agent.path.corners.Length;
+				var corners = agent.path.corners;
+				lineRenderer.SetPositions(corners);
+				if (lineRenderer.positionCount > 0) // 路径存在且正在计算
+				{
+					//animator.SetBool("Run", true);
+					// Debug.Log("状态为True！");
+				}
+			}
 		}
 
 		if (agent.remainingDistance <= agent.stoppingDistance)	

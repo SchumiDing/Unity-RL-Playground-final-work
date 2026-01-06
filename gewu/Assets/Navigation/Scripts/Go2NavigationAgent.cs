@@ -36,6 +36,11 @@ public class Go2NavigationAgent : Agent
     [Header("训练参数")]
     public bool train = true;  // 是否训练模式
     
+    // 全局时间窗口（用于同步所有agent的episode结束）
+    private static float globalEpisodeStartTime = 0f;
+    private static float globalEpisodeDuration = 60f;  // 全局episode持续时间（秒）
+    private static bool globalEpisodeEnded = false;
+    
     // 位置历史
     private Queue<Vector3> positionHistory = new Queue<Vector3>();
     private Queue<float> timeHistory = new Queue<float>();
@@ -46,17 +51,33 @@ public class Go2NavigationAgent : Agent
     private float episodeStartTime;
     private float episodeTime;
     private bool hasReachedTarget = false;
+    private int tt = 0;  // 步数计数器
+    
+    // 倒地检测参数
+    private float fallenTime = 0f;  // 倒地持续时间
+    private float fallenThreshold = 0.3f;  // 倒地判定时间阈值（秒）
+    private float minMovementThreshold = 0.1f;  // 最小移动幅度阈值（米/秒）
+    private float stillTime = 0f;  // 静止持续时间
+    private float stillThreshold = 3f;  // 静止判定时间阈值（秒）
     
     // 动作模式映射（对应Go2ControlAgent的6种动作）
     private int[] actionToControlParams = new int[6] { 0, 1, 2, 3, 4, 5 };
     
+    // 并行训练
+    private bool _isClone = false;
+    private Transform targetPointInstance;  // 克隆agent的目标点实例
+    
     Transform body;
     ArticulationBody[] arts;
+    Vector3 pos0;
+    Quaternion rot0;
     
     public override void Initialize()
     {
         arts = this.GetComponentsInChildren<ArticulationBody>();
         body = arts[0].GetComponent<Transform>();
+        pos0 = body.position;
+        rot0 = body.rotation;
         
         // 检查是否有底层控制Agent
         if (controlAgent == null)
@@ -65,22 +86,110 @@ public class Go2NavigationAgent : Agent
         }
         useControlAgent = (controlAgent != null);
         
+        // 如果是克隆agent，创建独立的目标点
+        if (_isClone && targetPoint != null)
+        {
+            GameObject targetObj = new GameObject($"TargetPoint_{name}");
+            targetPointInstance = targetObj.transform;
+            targetPointInstance.position = targetPoint.position;
+        }
+        else
+        {
+            targetPointInstance = targetPoint;
+        }
+        
         // 初始化位置历史
         for (int i = 0; i < historyLength; i++)
         {
             positionHistory.Enqueue(body.position);
             timeHistory.Enqueue(0f);
         }
+        
+        // 禁用ML-Agents观察空间大小不匹配的警告
+        // 这是因为导航Agent和底层控制Agent有不同的观察空间大小
+        // 使用日志回调来过滤这个特定的警告
+        if (!_isClone)  // 只在原始agent上设置一次
+        {
+            Application.logMessageReceived += FilterObservationWarning;
+        }
+    }
+    
+    // 过滤观察空间大小警告
+    void FilterObservationWarning(string logString, string stackTrace, LogType type)
+    {
+        // 如果是不匹配观察空间大小的警告，完全忽略
+        if (type == LogType.Warning && 
+            (logString.Contains("More observations") || logString.Contains("observations will be truncated")))
+        {
+            return;  // 不输出这个警告
+        }
+        
+        // 其他日志正常输出（使用默认行为）
+        // 注意：这里不能直接调用Debug.Log，否则会递归
+        // Unity会自动处理其他日志
+    }
+    
+    void OnDestroy()
+    {
+        // 清理日志回调（只在原始agent上清理）
+        if (!_isClone)
+        {
+            Application.logMessageReceived -= FilterObservationWarning;
+        }
+    }
+    
+    void Start()
+    {
+        if (train && !_isClone)
+        {
+            // 初始化全局时间窗口
+            globalEpisodeStartTime = Time.time;
+            globalEpisodeDuration = maxEpisodeTime;
+            globalEpisodeEnded = false;
+            
+            // 创建63个训练实例（总共64个agent）
+            for (int i = 1; i < 64; i++)
+            {
+                GameObject clone = Instantiate(gameObject);
+                clone.name = $"{name}_Clone_{i}";
+                Go2NavigationAgent navAgent = clone.GetComponent<Go2NavigationAgent>();
+                navAgent._isClone = true;
+                
+                // 为克隆agent创建独立的目标点
+                if (targetPoint != null)
+                {
+                    GameObject targetObj = new GameObject($"TargetPoint_{clone.name}");
+                    navAgent.targetPoint = targetObj.transform;
+                    navAgent.targetPoint.position = targetPoint.position;
+                }
+            }
+        }
     }
     
     public override void OnEpisodeBegin()
     {
+        // 如果是原始agent且训练模式，重置全局时间窗口
+        if (train && !_isClone)
+        {
+            globalEpisodeStartTime = Time.time;
+            globalEpisodeEnded = false;
+        }
+        
         // 重置状态
         episodeStartTime = Time.time;
         episodeTime = 0f;
         hasReachedTarget = false;
         decisionTimer = 0f;
         currentActionChoice = 0;
+        tt = 0;  // 重置步数计数器
+        fallenTime = 0f;  // 重置倒地时间
+        stillTime = 0f;  // 重置静止时间
+        
+        // 调试：确认episode开始
+        if (train && !_isClone && tt == 0)
+        {
+            Debug.Log($"[导航训练] Episode开始 | maxEpisodeTime={maxEpisodeTime}s | 全局时间窗口={globalEpisodeDuration}s");
+        }
         
         // 重置位置历史
         positionHistory.Clear();
@@ -94,21 +203,52 @@ public class Go2NavigationAgent : Agent
         // 设置起始位置和目标位置
         if (train)
         {
-            // 随机起始位置
-            startPoint = body.position + new Vector3(
-                Random.Range(-5f, 5f),
+            // 为每个agent设置不同的随机起始位置（避免重叠）
+            int agentIndex = _isClone ? int.Parse(name.Substring(name.LastIndexOf("_") + 1)) : 0;
+            float spacing = 3f;  // agent之间的间距
+            float gridSize = Mathf.Ceil(Mathf.Sqrt(64));  // 8x8网格
+            int row = agentIndex / (int)gridSize;
+            int col = agentIndex % (int)gridSize;
+            
+            // 基础位置 + 网格偏移 + 随机扰动
+            Vector3 baseOffset = new Vector3(
+                (col - gridSize / 2) * spacing,
                 0,
-                Random.Range(-5f, 5f)
+                (row - gridSize / 2) * spacing
             );
+            
+            startPoint = body.position + baseOffset + new Vector3(
+                Random.Range(-1f, 1f),
+                0,
+                Random.Range(-1f, 1f)
+            );
+            
+            // 重置机器人位置和姿态
+            arts[0].TeleportRoot(startPoint, rot0);
+            arts[0].velocity = Vector3.zero;
+            arts[0].angularVelocity = Vector3.zero;
+            
+            // 更新初始位置记录
+            pos0 = startPoint;
             
             // 随机目标位置（距离起始点一定范围）
             float distance = Random.Range(5f, 15f);
             float angle = Random.Range(0f, 360f) * Mathf.Deg2Rad;
-            targetPoint.position = startPoint + new Vector3(
+            Vector3 targetPos = startPoint + new Vector3(
                 Mathf.Cos(angle) * distance,
                 0,
                 Mathf.Sin(angle) * distance
             );
+            
+            // 使用目标点实例（克隆agent使用独立的目标点）
+            if (targetPointInstance != null)
+            {
+                targetPointInstance.position = targetPos;
+            }
+            else if (targetPoint != null)
+            {
+                targetPoint.position = targetPos;
+            }
         }
         
         // 重置机器人位置
@@ -127,8 +267,12 @@ public class Go2NavigationAgent : Agent
     {
         currentPosition = body.position;
         
+        // 获取目标点位置（使用目标点实例或原始目标点）
+        Vector3 targetPos = (targetPointInstance != null) ? targetPointInstance.position : 
+                           (targetPoint != null ? targetPoint.position : Vector3.zero);
+        
         // 1. 当前位置相对于目标的位置（4维：方向3维+距离1维）
-        Vector3 toTarget = targetPoint.position - currentPosition;
+        Vector3 toTarget = targetPos - currentPosition;
         float distanceToTarget = toTarget.magnitude;
         if (distanceToTarget > 0.001f)
         {
@@ -175,7 +319,9 @@ public class Go2NavigationAgent : Agent
         float timeRatio = 1f - (episodeTime / maxEpisodeTime);
         sensor.AddObservation(timeRatio);
         
-        // 总观察空间：3 + 30 + 10 + 3 + 2 + 1 = 49维
+        // 总观察空间：4 + 30 + 10 + 3 + 2 + 1 = 50维
+        // 注意：如果Behavior Parameters中设置的Space Size小于实际观察数，ML-Agents会截断并警告
+        // 这是正常的，因为底层控制Agent（Go2ControlAgent）有41维观察，但导航Agent只需要自己的观察
     }
     
     float EulerTrans(float eulerAngle)
@@ -246,7 +392,11 @@ public class Go2NavigationAgent : Agent
     
     void ApplyControlAction(int actionIndex)
     {
-        if (!useControlAgent || controlAgent == null) return;
+        if (!useControlAgent || controlAgent == null)
+        {
+            Debug.LogWarning("[Go2NavigationAgent] controlAgent未设置或为空！");
+            return;
+        }
         
         // 根据动作索引设置控制参数并更新底层控制Agent
         // 0: 前进 [0,0,0,0,0]
@@ -258,6 +408,14 @@ public class Go2NavigationAgent : Agent
         
         Go2ControlAgent.ActionMode mode = (Go2ControlAgent.ActionMode)actionIndex;
         controlAgent.SetControlParamsFromMode(mode);
+        
+        // 调试信息
+        if (train && tt % 200 == 0)  // 每200步打印一次
+        {
+            Debug.Log($"[导航训练] 选择动作: {actionIndex} ({mode}) | " +
+                     $"控制参数: [{controlAgent.controlParam1}, {controlAgent.controlParam2}, " +
+                     $"{controlAgent.controlParam3}, {controlAgent.controlParam4}, {controlAgent.controlParam5}]");
+        }
     }
     
     public override void Heuristic(in ActionBuffers actionsOut)
@@ -276,6 +434,10 @@ public class Go2NavigationAgent : Agent
     
     void FixedUpdate()
     {
+        // 更新当前位置
+        currentPosition = body.position;
+        
+        tt++;  // 增加步数
         episodeTime = Time.time - episodeStartTime;
         
         // 更新位置历史
@@ -284,11 +446,17 @@ public class Go2NavigationAgent : Agent
         timeHistory.Dequeue();
         timeHistory.Enqueue(episodeTime);
         
-        // 计算奖励
+        // 计算奖励（必须在检查结束条件之前调用，与其他训练脚本保持一致）
         CalculateRewards();
         
-        // 检查episode结束条件
-        CheckEpisodeEnd();
+        // 检查episode结束条件（必须在AddReward之后调用，与其他训练脚本保持一致）
+        // 参考Go2StandAgent和Go2WalkAgent的模式：AddReward -> 检查条件 -> EndEpisode
+        bool shouldEnd = CheckEpisodeEnd();
+        
+        if (shouldEnd && train)
+        {
+            EndEpisode();
+        }
         
         lastPosition = currentPosition;
     }
@@ -297,8 +465,11 @@ public class Go2NavigationAgent : Agent
     {
         float reward = 0f;
         
+        // 获取目标点位置（使用目标点实例或原始目标点）
+        Vector3 targetPos = (targetPointInstance != null) ? targetPointInstance.position : targetPoint.position;
+        
         // 1. 到达目标奖励（大奖励）
-        float distanceToTarget = Vector3.Distance(currentPosition, targetPoint.position);
+        float distanceToTarget = Vector3.Distance(currentPosition, targetPos);
         if (distanceToTarget < targetReachDistance && !hasReachedTarget)
         {
             reward += 10f;  // 到达目标
@@ -307,7 +478,7 @@ public class Go2NavigationAgent : Agent
         else
         {
             // 接近目标奖励（鼓励向目标移动）
-            float lastDistance = Vector3.Distance(lastPosition, targetPoint.position);
+            float lastDistance = Vector3.Distance(lastPosition, targetPos);
             float distanceImprovement = lastDistance - distanceToTarget;
             reward += distanceImprovement * 0.5f;  // 每接近1米奖励0.5
         }
@@ -371,40 +542,116 @@ public class Go2NavigationAgent : Agent
         return heightTooLow || tiltTooMuch;
     }
     
-    void CheckEpisodeEnd()
+    bool CheckEpisodeEnd()
     {
         bool shouldEnd = false;
+        string endReason = "";
+        
+        // 0. 检查全局时间窗口（优先检查，确保所有agent同时结束）
+        if (train)
+        {
+            float globalElapsedTime = Time.time - globalEpisodeStartTime;
+            if (globalElapsedTime >= globalEpisodeDuration && !globalEpisodeEnded)
+            {
+                shouldEnd = true;
+                endReason = $"全局时间窗口超时（{globalEpisodeDuration}秒）";
+                
+                // 标记全局episode已结束（只标记一次）
+                if (!_isClone)
+                {
+                    globalEpisodeEnded = true;
+                    Debug.Log($"[全局时间窗口] 触发所有agent同时结束 | 全局时间={globalElapsedTime:F2}s");
+                }
+            }
+        }
         
         // 1. 到达目标
         if (hasReachedTarget)
         {
             shouldEnd = true;
+            endReason = "到达目标";
         }
         
-        // 2. 超时
+        // 2. 超时（导航时间过长）- 作为备用检查
+        // 使用>=确保超时一定会触发
         if (episodeTime >= maxEpisodeTime)
         {
             shouldEnd = true;
+            endReason = $"超时（{maxEpisodeTime}秒）";
+            
+            // 调试：确认超时检测被触发
+            if (train && !_isClone)
+            {
+                Debug.Log($"[超时检测] 触发超时 | episodeTime={episodeTime:F2}s | maxEpisodeTime={maxEpisodeTime}s");
+            }
         }
         
-        // 3. 摔倒（高度过低）
-        if (body.position.y < startPoint.y - 0.5f)
+        // 调试：每5秒输出一次episode状态（仅原始agent，训练模式）
+        if (train && !_isClone && tt > 0 && tt % 500 == 0)  // FixedUpdate是0.01秒，500步=5秒
         {
-            shouldEnd = true;
+            Vector3 targetPos = (targetPointInstance != null) ? targetPointInstance.position : targetPoint.position;
+            float distanceToTarget = Vector3.Distance(currentPosition, targetPos);
+            Debug.Log($"[调试] Episode状态 | 时间: {episodeTime:F1}s/{maxEpisodeTime}s | " +
+                     $"步数: {tt} | 是否到达: {hasReachedTarget} | " +
+                     $"距离目标: {distanceToTarget:F2}m | " +
+                     $"位置: ({currentPosition.x:F1}, {currentPosition.y:F1}, {currentPosition.z:F1})");
         }
         
-        // 4. 姿态过度倾斜
+        // 3. 检查是否摔倒
+        bool isFallen = IsFallen();
+        if (isFallen)
+        {
+            fallenTime += Time.fixedDeltaTime;
+            
+            // 计算移动速度
+            Vector3 velocity = (currentPosition - lastPosition) / Time.fixedDeltaTime;
+            float speed = velocity.magnitude;
+            
+            // 如果倒地且移动幅度很小
+            if (speed < minMovementThreshold)
+            {
+                stillTime += Time.fixedDeltaTime;
+                
+                // 如果倒地且长时间静止
+                if (fallenTime >= fallenThreshold && stillTime >= stillThreshold)
+                {
+                    shouldEnd = true;
+                    endReason = $"倒地且长时间静止（{fallenTime:F1}秒倒地，{stillTime:F1}秒静止）";
+                }
+            }
+            else
+            {
+                // 如果还在移动，重置静止时间
+                stillTime = 0f;
+            }
+        }
+        else
+        {
+            // 如果没有摔倒，重置倒地时间和静止时间
+            fallenTime = 0f;
+            stillTime = 0f;
+        }
+        
+        // 4. 姿态过度倾斜（立即结束）
         float pitch = EulerTrans(body.eulerAngles.x);
         float roll = EulerTrans(body.eulerAngles.z);
-        if (Mathf.Abs(pitch) > 45f || Mathf.Abs(roll) > 45f)
+        if (Mathf.Abs(pitch) > 60f || Mathf.Abs(roll) > 60f)
         {
             shouldEnd = true;
+            endReason = $"姿态过度倾斜（Pitch={pitch:F1}°, Roll={roll:F1}°）";
         }
         
-        if (shouldEnd && train)
+        // 如果应该结束，输出日志（但不在这里调用EndEpisode，由FixedUpdate调用）
+        if (shouldEnd && train && !string.IsNullOrEmpty(endReason) && !_isClone)
         {
-            EndEpisode();
+            Vector3 targetPos = (targetPointInstance != null) ? targetPointInstance.position : targetPoint.position;
+            Debug.Log($"[导航训练] Episode结束 | 原因: {endReason} | " +
+                     $"时间: {episodeTime:F1}s | " +
+                     $"步数: {tt} | " +
+                     $"距离目标: {Vector3.Distance(currentPosition, targetPos):F2}m");
         }
+        
+        return shouldEnd;
     }
     
     // 公共方法：供外部设置目标点

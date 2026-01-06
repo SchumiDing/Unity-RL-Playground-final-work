@@ -340,35 +340,122 @@ public class Go2ControlAgent : Agent
     
     public override void OnActionReceived(ActionBuffers actionBuffers)
     {
-        for (int i = 0; i < 12; i++) utotal[i] = 0;
-        var continuousActions = actionBuffers.ContinuousActions;
-        var kk = 0.9f;  // 动作平滑系数
-        
-        kb = new float[12] { 30, 30, 50, 30, 30, 50, 30, 30, 50, 30, 30, 50 };
-        
-        for (int i = 0; i < ActionNum; i++)
+        // 训练模式下，从ML-Agents接收动作
+        if (train)
         {
-            u[i] = u[i] * kk + (1 - kk) * continuousActions[i];
-            utotal[i] = kb[i] * u[i];
-            if (fixbody) utotal[i] = 0;
+            for (int i = 0; i < 12; i++) utotal[i] = 0;
+            var continuousActions = actionBuffers.ContinuousActions;
+            var kk = 0.9f;  // 动作平滑系数
+            
+            kb = new float[12] { 30, 30, 50, 30, 30, 50, 30, 30, 50, 30, 30, 50 };
+            
+            for (int i = 0; i < ActionNum; i++)
+            {
+                u[i] = u[i] * kk + (1 - kk) * continuousActions[i];
+                utotal[i] = kb[i] * u[i];
+                if (fixbody) utotal[i] = 0;
+            }
+
+            // 根据动作模式调整步态控制
+            d0 = 30;
+            dh = 20;
+            T1 = 30;
+            
+            // 应用步态模式（对角步态）
+            utotal[1] += dh * uf1 + d0;
+            utotal[2] += (dh * uf1 + d0) * -2;
+            utotal[4] += dh * uf2 + d0;
+            utotal[5] += (dh * uf2 + d0) * -2;
+            utotal[7] += dh * uf2 + d0;
+            utotal[8] += (dh * uf2 + d0) * -2;
+            utotal[10] += dh * uf1 + d0;
+            utotal[11] += (dh * uf1 + d0) * -2;
+
+            for (int i = 0; i < ActionNum; i++) SetJointTargetDeg(acts[i], utotal[i]);
         }
+        else
+        {
+            // 非训练模式下，从模型接收动作（如果模型已加载）
+            // ML-Agents会自动调用这个方法进行推理
+            for (int i = 0; i < 12; i++) utotal[i] = 0;
+            var continuousActions = actionBuffers.ContinuousActions;
+            var kk = 0.9f;  // 动作平滑系数
+            
+            kb = new float[12] { 30, 30, 50, 30, 30, 50, 30, 30, 50, 30, 30, 50 };
+            
+            for (int i = 0; i < ActionNum; i++)
+            {
+                u[i] = u[i] * kk + (1 - kk) * continuousActions[i];
+                utotal[i] = kb[i] * u[i];
+                if (fixbody) utotal[i] = 0;
+            }
 
-        // 根据动作模式调整步态控制
-        d0 = 30;
-        dh = 20;
-        T1 = 30;
+            // 根据动作模式调整步态控制
+            d0 = 30;
+            dh = 20;
+            T1 = 30;
+            
+            // 应用步态模式（对角步态）
+            utotal[1] += dh * uf1 + d0;
+            utotal[2] += (dh * uf1 + d0) * -2;
+            utotal[4] += dh * uf2 + d0;
+            utotal[5] += (dh * uf2 + d0) * -2;
+            utotal[7] += dh * uf2 + d0;
+            utotal[8] += (dh * uf2 + d0) * -2;
+            utotal[10] += dh * uf1 + d0;
+            utotal[11] += (dh * uf1 + d0) * -2;
+
+            for (int i = 0; i < ActionNum; i++) SetJointTargetDeg(acts[i], utotal[i]);
+        }
+    }
+    
+    // 执行控制动作（非训练模式下使用）
+    void ExecuteControlAction()
+    {
+        // 在非训练模式下，如果模型已加载，ML-Agents会自动调用OnActionReceived
+        // 但为了确保动作执行，我们也在这里执行基础控制
+        // 注意：如果模型已加载，OnActionReceived会被调用，这里作为备用
         
-        // 应用步态模式（对角步态）
-        utotal[1] += dh * uf1 + d0;
-        utotal[2] += (dh * uf1 + d0) * -2;
-        utotal[4] += dh * uf2 + d0;
-        utotal[5] += (dh * uf2 + d0) * -2;
-        utotal[7] += dh * uf2 + d0;
-        utotal[8] += (dh * uf2 + d0) * -2;
-        utotal[10] += dh * uf1 + d0;
-        utotal[11] += (dh * uf1 + d0) * -2;
+        // 检查是否有Behavior Parameters且模型已加载
+        var behaviorParams = GetComponent<Unity.MLAgents.Policies.BehaviorParameters>();
+        bool hasModel = behaviorParams != null && behaviorParams.Model != null;
+        
+        // 如果模型已加载，ML-Agents会自动处理，这里只做基础控制
+        // 如果没有模型，使用基础步态控制
+        if (!hasModel)
+        {
+            for (int i = 0; i < 12; i++) utotal[i] = 0;
+            
+            var kk = 0.9f;
+            kb = new float[12] { 30, 30, 50, 30, 30, 50, 30, 30, 50, 30, 30, 50 };
+            
+            // 根据当前动作模式生成基础动作
+            for (int i = 0; i < ActionNum; i++)
+            {
+                // 基础动作值（根据动作模式调整，非训练模式下使用基础步态）
+                // 由于baseAction总是0，直接使用平滑系数更新u数组
+                u[i] = u[i] * kk;  // 平滑衰减
+                utotal[i] = kb[i] * u[i];
+                if (fixbody) utotal[i] = 0;
+            }
 
-        for (int i = 0; i < ActionNum; i++) SetJointTargetDeg(acts[i], utotal[i]);
+            // 根据动作模式调整步态控制
+            d0 = 30;
+            dh = 20;
+            T1 = 30;
+            
+            // 应用步态模式（对角步态）
+            utotal[1] += dh * uf1 + d0;
+            utotal[2] += (dh * uf1 + d0) * -2;
+            utotal[4] += dh * uf2 + d0;
+            utotal[5] += (dh * uf2 + d0) * -2;
+            utotal[7] += dh * uf2 + d0;
+            utotal[8] += (dh * uf2 + d0) * -2;
+            utotal[10] += dh * uf1 + d0;
+            utotal[11] += (dh * uf1 + d0) * -2;
+
+            for (int i = 0; i < ActionNum; i++) SetJointTargetDeg(acts[i], utotal[i]);
+        }
     }
     
     void SetJointTargetDeg(ArticulationBody joint, float x)
@@ -392,6 +479,29 @@ public class Go2ControlAgent : Agent
 
     void FixedUpdate()
     {
+        // 非训练模式下，根据控制参数执行动作（用于导航训练）
+        if (!train)
+        {
+            // 根据控制参数确定当前动作模式
+            ActionMode mode = ActionMode.Forward;
+            if (controlParam1 > 0.5f) mode = ActionMode.LeftStrafe;
+            else if (controlParam2 > 0.5f) mode = ActionMode.RightStrafe;
+            else if (controlParam3 > 0.5f) mode = ActionMode.LeftTurn;
+            else if (controlParam4 > 0.5f) mode = ActionMode.RightTurn;
+            else if (controlParam5 > 0.5f) mode = ActionMode.Backward;
+            
+            // 如果动作模式改变，更新目标速度
+            if (mode != currentActionMode)
+            {
+                currentActionMode = mode;
+                SetControlParamsFromMode(mode);
+            }
+            
+            // 在导航训练中，Go2ControlAgent应该根据控制参数直接执行动作
+            // 不依赖ML-Agents的OnActionReceived（因为它是被动执行器）
+            ExecuteControlAction();
+        }
+        
         // 演示模式：自动切换动作（仅原始agent，非训练模式）
         if (!train && !_isClone && enableDemoMode)
         {
