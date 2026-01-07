@@ -1,3 +1,11 @@
+这是我的具身智能前沿期末项目的代码
+代码仓库从gewu平台fork出来，主要修改在gewu/Assets/Navigation中，新增commit的代码都是用于训练的
+原本Navigation任务调用的是unity的包，我这里从头实现了机器人自主控制到自主导航全流程的训练
+训练流程分别是
+站立训练（stand）->前进训练（walk）->控制信号操控训练（control）->导航训练（navigation）
+分别对应不同的同名c#代码和yaml训练配置文件
+导航训练时需要依赖控制训练的脚本开启inference来处理导航训练模型的信号
+
 # “格物”具身智能仿真平台 ([English](README_en.md) | [中文](README.md))
 
 # <img src="gewu/Image/gwlogo3.jpg" height="150" /> 
